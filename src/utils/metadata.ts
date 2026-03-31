@@ -152,15 +152,17 @@ function parseWebpExif(buffer: ArrayBuffer): Record<string, unknown> {
   return parseTiff(raw)
 }
 
-/** WebP RIFF에서 EXIF/XMP/ICCP 청크 제거 + VP8X 플래그 갱신 */
+/** WebP RIFF에서 필수 청크(VP8, VP8L, VP8X, ALPH, ANIM, ANMF)만 남기고 제거 */
 export function removeWebpMetadata(buffer: ArrayBuffer): ArrayBuffer {
-  const META   = new Set(['EXIF', 'XMP ', 'ICCP'])
-  const src    = new Uint8Array(buffer)
-  const chunks = parseWebpChunks(buffer)
-  if (chunks.length === 0 || !chunks.some(c => META.has(c.fourcc))) return buffer
+  const ESSENTIAL = new Set(['VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ANIM', 'ANMF'])
+  const src       = new Uint8Array(buffer)
+  const chunks    = parseWebpChunks(buffer)
+  if (chunks.length === 0) return buffer
 
-  const keep = chunks.filter(c => !META.has(c.fourcc))
-  let bodySize = 4
+  const keep = chunks.filter(c => ESSENTIAL.has(c.fourcc))
+  if (keep.length === chunks.length) return buffer // No metadata chunks to remove
+
+  let bodySize = 4 // 'WEBP'
   for (const c of keep) bodySize += 8 + c.size + (c.size % 2)
 
   const out     = new Uint8Array(8 + bodySize)
@@ -172,7 +174,10 @@ export function removeWebpMetadata(buffer: ArrayBuffer): ArrayBuffer {
   for (const c of keep) {
     const len = 8 + c.size + (c.size % 2)
     out.set(src.slice(c.dataOffset - 8, c.dataOffset - 8 + len), off)
-    if (c.fourcc === 'VP8X') out[off + 8] &= ~(0x08 | 0x10 | 0x02) // clear EXIF/XMP/ICC flags
+    // Clear EXIF/XMP/ICC flags in VP8X if it exists
+    if (c.fourcc === 'VP8X') {
+      out[off + 8] &= ~(0x08 | 0x10 | 0x02)
+    }
     off += len
   }
   return out.buffer
@@ -204,15 +209,15 @@ function parseJpegExif(buffer: ArrayBuffer): Record<string, unknown> {
   return {}
 }
 
-// ─── PNG tEXt / iTXt 파서 ────────────────────────────────────────────────────
+// ─── PNG tEXt / iTXt / zTXt / EXIf 파서 ────────────────────────────────────
 
 const PNG_SIG = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
 
-async function parsePngTextChunks(file: File): Promise<Record<string, string>> {
+async function parsePngMetadataChunks(file: File): Promise<Record<string, string>> {
   const buf      = await file.arrayBuffer()
   const bytes    = new Uint8Array(buf)
   const view     = new DataView(buf)
-  const dec      = new TextDecoder()
+  const dec      = new TextDecoder('utf-8')
   const decLatin = new TextDecoder('latin1')
   const result: Record<string, string> = {}
 
@@ -224,36 +229,138 @@ async function parsePngTextChunks(file: File): Promise<Record<string, string>> {
     const type   = String.fromCharCode(bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7])
     if (type === 'IEND') break
 
+    const data = bytes.subarray(offset + 8, offset + 8 + length)
+
     if (type === 'tEXt' && length > 0) {
-      const data    = bytes.subarray(offset + 8, offset + 8 + length)
       const nullIdx = data.indexOf(0)
       if (nullIdx > 0) {
         result[decLatin.decode(data.subarray(0, nullIdx))] =
           decLatin.decode(data.subarray(nullIdx + 1))
       }
     } else if (type === 'iTXt' && length > 0) {
-      const data    = bytes.subarray(offset + 8, offset + 8 + length)
       const nullIdx = data.indexOf(0)
       if (nullIdx > 0) {
         const key        = dec.decode(data.subarray(0, nullIdx))
         const compressed = data[nullIdx + 1] !== 0
+        // compressed iTXt is rare but possible; we don't fully decompress here for simplicity,
+        // but we mark its existence.
         if (!compressed) {
           let p = nullIdx + 2
           while (p < data.length && data[p] !== 0) p++; p++ // skip language tag
           while (p < data.length && data[p] !== 0) p++; p++ // skip translated keyword
           if (p < data.length) result[key] = dec.decode(data.subarray(p))
+        } else {
+          result[key] = '[Compressed iTXt]'
         }
       }
+    } else if (type === 'zTXt' && length > 0) {
+      const nullIdx = data.indexOf(0)
+      if (nullIdx > 0) {
+        result[decLatin.decode(data.subarray(0, nullIdx))] = '[Compressed zTXt]'
+      }
+    } else if (type === 'EXIf') {
+      result['EXIf'] = `[Exif Data ${length} bytes]`
+    } else if (type === 'iCCP') {
+      result['iCCP'] = `[ICC Profile ${length} bytes]`
     }
     offset += 12 + length
   }
   return result
 }
 
+/** PNG에서 중요 청크(IHDR, PLTE, IDAT, IEND, tRNS, acTL, fcTL, fdAT)만 남기고 제거 */
+export function removePngMetadata(buffer: ArrayBuffer): ArrayBuffer {
+  const CRITICAL = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'acTL', 'fcTL', 'fdAT'])
+  const src      = new Uint8Array(buffer)
+  const view     = new DataView(buffer)
+  
+  if (src[0] !== 0x89 || src[1] !== 0x50) return buffer
+
+  const keptChunks: Uint8Array[] = [src.slice(0, 8)] // Signature
+  let offset = 8
+  let hasMeta = false
+
+  while (offset + 12 <= src.length) {
+    const length = view.getUint32(offset, false)
+    const type   = String.fromCharCode(src[offset+4], src[offset+5], src[offset+6], src[offset+7])
+    const fullLen = 12 + length
+
+    if (CRITICAL.has(type)) {
+      keptChunks.push(src.slice(offset, offset + fullLen))
+    } else {
+      hasMeta = true
+    }
+    if (type === 'IEND') break
+    offset += fullLen
+  }
+
+  if (!hasMeta) return buffer
+
+  const totalLen = keptChunks.reduce((sum, c) => sum + c.length, 0)
+  const out = new Uint8Array(totalLen)
+  let off = 0
+  for (const c of keptChunks) {
+    out.set(c, off)
+    off += c.length
+  }
+  return out.buffer
+}
+
+/** JPEG에서 APP0(JFIF)과 DQT, DHT, SOF, SOS 등을 제외한 APPn(Metadata) 제거 */
+export function removeJpegMetadata(buffer: ArrayBuffer): ArrayBuffer {
+  const src = new Uint8Array(buffer)
+  if (src[0] !== 0xFF || src[1] !== 0xD8) return buffer
+
+  const kept: Uint8Array[] = [src.slice(0, 2)] // SOI
+  let offset = 2
+  let hasMeta = false
+
+  while (offset + 4 <= src.length) {
+    if (src[offset] !== 0xFF) break
+    const marker = src[offset + 1]
+    if (marker === 0xD9) { // EOI
+      kept.push(src.slice(offset, offset + 2))
+      break
+    }
+    const length = (src[offset + 2] << 8) | src[offset + 3]
+    const fullLen = 2 + length
+
+    // APPn markers are 0xE0 ~ 0xEF
+    // APP0 (0xE0) is JFIF (keep it)
+    // APP1 (0xE1) is Exif/XMP (remove)
+    // APP2-15 are usually metadata or color profiles (remove)
+    // COM (0xFE) is comment (remove)
+    const isMetadata = (marker >= 0xE1 && marker <= 0xEF) || marker === 0xFE
+    
+    if (!isMetadata) {
+      kept.push(src.slice(offset, offset + fullLen))
+    } else {
+      hasMeta = true
+    }
+
+    if (marker === 0xDA) { // SOS - rest is entropy data
+      kept.push(src.slice(offset + fullLen))
+      break
+    }
+    offset += fullLen
+  }
+
+  if (!hasMeta) return buffer
+
+  const totalLen = kept.reduce((sum, c) => sum + c.length, 0)
+  const out = new Uint8Array(totalLen)
+  let off = 0
+  for (const c of kept) {
+    out.set(c, off)
+    off += c.length
+  }
+  return out.buffer
+}
+
 // ─── 메타데이터 있는지 여부 (RIFF 청크 수준) ──────────────────────────────────
 
 function webpHasMetaChunks(buffer: ArrayBuffer): boolean {
-  return parseWebpChunks(buffer).some(c => ['EXIF', 'XMP ', 'ICCP'].includes(c.fourcc))
+  return parseWebpChunks(buffer).some(c => !['RIFF', 'WEBP', 'VP8 ', 'VP8L', 'VP8X', 'ALPH', 'ANIM', 'ANMF'].includes(c.fourcc))
 }
 
 // ─── NAI 파싱 ─────────────────────────────────────────────────────────────────
@@ -365,7 +472,7 @@ export async function readMetadata(file: File): Promise<MetadataResult | null> {
     // ── PNG ─────────────────────────────────────────────────────────────────
     else if (file.type === 'image/png' || ext === 'png') {
       // PNG tEXt/iTXt chunks (NAI, SD, ComfyUI store metadata here)
-      const textChunks = await parsePngTextChunks(file)
+      const textChunks = await parsePngMetadataChunks(file)
       if (Object.keys(textChunks).length > 0) { hasRealMeta = true; raw = { ...raw, ...textChunks } }
     }
 
@@ -381,7 +488,7 @@ export async function readMetadata(file: File): Promise<MetadataResult | null> {
         if (Object.keys(exif).length > 0) { hasRealMeta = true; raw = { ...raw, ...exif } }
       } else if (u8[0] === 0x89 && u8[1] === 0x50) {
         // PNG
-        const textChunks = await parsePngTextChunks(file)
+        const textChunks = await parsePngMetadataChunks(file)
         if (Object.keys(textChunks).length > 0) { hasRealMeta = true; raw = { ...raw, ...textChunks } }
       }
     }

@@ -1,5 +1,5 @@
 import type { ConvertOptions } from '../types'
-import { removeWebpMetadata } from './metadata'
+import { removeWebpMetadata, removePngMetadata, removeJpegMetadata } from './metadata'
 
 const MIME: Record<string, string> = {
   png:  'image/png',
@@ -9,21 +9,41 @@ const MIME: Record<string, string> = {
 
 /**
  * Process (strip metadata + optionally convert/resize) a single image.
- *
- * WebP → WebP with no resize and max quality: RIFF chunk removal (lossless,
- * bit-exact pixel data). All other cases: OffscreenCanvas re-draw (strips
- * all metadata, handles format conversion and resizing).
  */
 export async function processImage(file: File, options: ConvertOptions): Promise<Blob> {
-  const isWebpIn  = file.type === 'image/webp' || file.name.toLowerCase().endsWith('.webp')
-  const isWebpOut = options.format === 'webp'
-  const noResize  = options.resize === 'original'
-  const maxQual   = options.quality >= 100
+  const extIn = file.name.toLowerCase().split('.').pop()
+  const isWebpIn = file.type === 'image/webp' || extIn === 'webp'
+  const isPngIn  = file.type === 'image/png'  || extIn === 'png'
+  const isJpegIn = file.type === 'image/jpeg' || extIn === 'jpg' || extIn === 'jpeg'
 
-  if (isWebpIn && isWebpOut && noResize && maxQual) {
+  const isSameFormat =
+    (isWebpIn && options.format === 'webp') ||
+    (isPngIn  && options.format === 'png') ||
+    (isJpegIn && options.format === 'jpeg')
+
+  const noResize = options.resize === 'original'
+  const maxQual  = options.quality >= 100
+
+  // ── Optimization: Manual Chunk Stripping (Bit-exact pixels, fast, 100% metadata removal) ──
+  if (isSameFormat && noResize && maxQual) {
     const buf = await file.arrayBuffer()
-    const cleaned = removeWebpMetadata(buf)
-    return new Blob([cleaned], { type: 'image/webp' })
+    let cleaned: ArrayBuffer
+    let type = file.type
+
+    if (isWebpIn) {
+      cleaned = removeWebpMetadata(buf)
+      type = 'image/webp'
+    } else if (isPngIn) {
+      cleaned = removePngMetadata(buf)
+      type = 'image/png'
+    } else if (isJpegIn) {
+      cleaned = removeJpegMetadata(buf)
+      type = 'image/jpeg'
+    } else {
+      return convertViaCanvas(file, options)
+    }
+
+    return new Blob([cleaned], { type })
   }
 
   return convertViaCanvas(file, options)
@@ -46,17 +66,19 @@ async function convertViaCanvas(file: File, options: ConvertOptions): Promise<Bl
   if (typeof OffscreenCanvas !== 'undefined') {
     const canvas = new OffscreenCanvas(w, h)
     const ctx = canvas.getContext('2d')!
+    
+    // Transparent -> White for JPEG
     if (options.format === 'jpeg') {
-      // Flatten transparency to white for JPEG
       ctx.fillStyle = '#ffffff'
       ctx.fillRect(0, 0, w, h)
     }
+    
     ctx.drawImage(bitmap, 0, 0, w, h)
     bitmap.close()
     return canvas.convertToBlob({ type: mime, quality })
   }
 
-  // Safari <16.4 fallback
+  // Fallback
   return new Promise((resolve, reject) => {
     const canvas = document.createElement('canvas')
     canvas.width  = w
