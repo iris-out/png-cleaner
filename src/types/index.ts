@@ -4,6 +4,7 @@ export interface ConvertOptions {
   format: ImageFormat
   quality: number             // 0–100 (PNG는 무손실이므로 무시됨)
   resize: number | 'original' // 퍼센트 기준 (예: 80 = 원본의 80%), 'original' = 크기 유지
+  deepClean?: boolean         // 메타데이터 완전 박멸 (알파 채널 제거 및 픽셀 미세 변동으로 스테가노그래피 파괴)
 }
 
 // BatchSettings aliases ConvertOptions

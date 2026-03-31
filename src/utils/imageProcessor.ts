@@ -23,9 +23,11 @@ export async function processImage(file: File, options: ConvertOptions): Promise
 
   const noResize = options.resize === 'original'
   const maxQual  = options.quality >= 100
+  const deepClean = !!options.deepClean
 
-  // ── Optimization: Manual Chunk Stripping (Bit-exact pixels, fast, 100% metadata removal) ──
-  if (isSameFormat && noResize && maxQual) {
+  // ── Optimization: Manual Chunk Stripping (Bit-exact pixels, fast) ──
+  // Deep Clean이 꺼져있을 때만 이 최적화를 사용 (스테가노그래피 파괴를 위해선 픽셀 재분해 필요)
+  if (!deepClean && isSameFormat && noResize && maxQual) {
     const buf = await file.arrayBuffer()
     let cleaned: ArrayBuffer
     let type = file.type
@@ -63,37 +65,52 @@ async function convertViaCanvas(file: File, options: ConvertOptions): Promise<Bl
   const mime    = MIME[options.format] ?? 'image/png'
   const quality = options.format === 'png' ? undefined : options.quality / 100
 
-  if (typeof OffscreenCanvas !== 'undefined') {
-    const canvas = new OffscreenCanvas(w, h)
-    const ctx = canvas.getContext('2d')!
+  const drawAndExport = async (canvas: OffscreenCanvas | HTMLCanvasElement): Promise<Blob> => {
+    // 2D 컨텍스트 강제 캐스팅 (OffscreenCanvas도 2D 지원)
+    const ctx = canvas.getContext('2d') as (CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null)
+    if (!ctx) throw new Error('Could not get 2D context')
     
-    // Transparent -> White for JPEG
-    if (options.format === 'jpeg') {
+    // 1. 배경 처리
+    if (options.format === 'jpeg' || (options.format === 'png' && options.deepClean)) {
+      // JPEG는 투명도가 없으므로 흰색 배경. 
+      // PNG Deep Clean 시에도 투명도를 제거(알파 채널 파괴)하여 스테가노그래피 완전 제거 유도.
       ctx.fillStyle = '#ffffff'
       ctx.fillRect(0, 0, w, h)
     }
     
+    // 2. 이미지 그리기
     ctx.drawImage(bitmap, 0, 0, w, h)
+    
+    // 3. Pixel Washing (스테가노그래피 파괴를 위한 미세 변동)
+    if (options.deepClean) {
+      // 픽셀 하나만 미세하게 변경하여 데이터 재구성 유도
+      const imageData = ctx.getImageData(0, 0, 1, 1)
+      imageData.data[0] = (imageData.data[0] + 1) % 256 
+      ctx.putImageData(imageData, 0, 0)
+    }
+    
     bitmap.close()
-    return canvas.convertToBlob({ type: mime, quality })
+    
+    if ('convertToBlob' in canvas) {
+      return (canvas as OffscreenCanvas).convertToBlob({ type: mime, quality })
+    } else {
+      return new Promise((resolve, reject) => {
+        (canvas as HTMLCanvasElement).toBlob(
+          blob => blob ? resolve(blob) : reject(new Error('toBlob failed')),
+          mime,
+          quality,
+        )
+      })
+    }
   }
 
-  // Fallback
-  return new Promise((resolve, reject) => {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const canvas = new OffscreenCanvas(w, h)
+    return drawAndExport(canvas)
+  } else {
     const canvas = document.createElement('canvas')
     canvas.width  = w
     canvas.height = h
-    const ctx = canvas.getContext('2d')!
-    if (options.format === 'jpeg') {
-      ctx.fillStyle = '#ffffff'
-      ctx.fillRect(0, 0, w, h)
-    }
-    ctx.drawImage(bitmap, 0, 0, w, h)
-    bitmap.close()
-    canvas.toBlob(
-      blob => blob ? resolve(blob) : reject(new Error('canvas.toBlob failed')),
-      mime,
-      quality,
-    )
-  })
+    return drawAndExport(canvas)
+  }
 }

@@ -17,6 +17,7 @@ const DEFAULT_SETTINGS: BatchSettings = {
   format: 'png',
   quality: 100,
   resize: 'original',
+  deepClean: false,
 }
 
 export function useFileQueue() {

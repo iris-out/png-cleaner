@@ -127,6 +127,24 @@ export function BatchSettings({ settings, onChange }: BatchSettingsProps) {
           )}
         </div>
       </div>
+
+      <div className="control-group" style={{ marginTop: '1rem' }}>
+        <label className="checkbox-label" style={{ display: 'flex', alignItems: 'flex-start', cursor: 'pointer', gap: '8px' }}>
+          <input
+            type="checkbox"
+            checked={!!settings.deepClean}
+            onChange={e => onChange({ ...settings, deepClean: e.target.checked })}
+            style={{ marginTop: '3px' }}
+          />
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>딥 클린 (Deep Clean)</span>
+            <span style={{ fontSize: '0.75rem', opacity: 0.7, lineHeight: 1.4 }}>
+              NovelAI 등에서 숨겨놓은 "보이지 않는 메타데이터"(스테가노그래피)까지 픽셀 단위로 파괴합니다.
+              알파 채널이 제거되며 미세한 픽셀 변동이 발생할 수 있습니다.
+            </span>
+          </div>
+        </label>
+      </div>
     </div>
   )
 }
