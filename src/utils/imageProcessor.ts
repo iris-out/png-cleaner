@@ -9,108 +9,117 @@ const MIME: Record<string, string> = {
 
 /**
  * Process (strip metadata + optionally convert/resize) a single image.
+ *
+ * Pipeline summary:
+ *  - WebP output: always re-encode through canvas, scrub alpha LSBs (kills NAI stealth-pnginfo),
+ *    then chunk-strip. No bit-perfect fast path — NAI hides prompt data in alpha LSBs, so any
+ *    pass-through of original alpha bytes leaks the metadata.
+ *  - PNG / JPEG output: routed through a clean WebP intermediate. Decode → alpha-LSB-scrubbed
+ *    WebP encode → chunk-strip → re-decode → final PNG/JPEG encode → chunk-strip. Guarantees
+ *    no EXIF, no browser-injected metadata, and no alpha-channel stealth survives.
  */
 export async function processImage(file: File, options: ConvertOptions): Promise<Blob> {
-  const extIn = file.name.toLowerCase().split('.').pop()
-  const isWebpIn = file.type === 'image/webp' || extIn === 'webp'
-  const isPngIn  = file.type === 'image/png'  || extIn === 'png'
-  const isJpegIn = file.type === 'image/jpeg' || extIn === 'jpg' || extIn === 'jpeg'
-
-  const isSameFormat =
-    (isWebpIn && options.format === 'webp') ||
-    (isPngIn  && options.format === 'png') ||
-    (isJpegIn && options.format === 'jpeg')
-
-  const noResize = options.resize === 'original'
-  const maxQual  = options.quality >= 100
   const deepClean = !!options.deepClean
 
-  // ── Optimization: Manual Chunk Stripping (Bit-exact pixels, fast) ──
-  // Deep Clean이 꺼져있을 때만 이 최적화를 사용 (스테가노그래피 파괴를 위해선 픽셀 재분해 필요)
-  if (!deepClean && isSameFormat && noResize && maxQual) {
-    const buf = await file.arrayBuffer()
-    let cleaned: ArrayBuffer
-    let type = file.type
-
-    if (isWebpIn) {
-      cleaned = removeWebpMetadata(buf)
-      type = 'image/webp'
-    } else if (isPngIn) {
-      cleaned = removePngMetadata(buf)
-      type = 'image/png'
-    } else if (isJpegIn) {
-      cleaned = removeJpegMetadata(buf)
-      type = 'image/jpeg'
-    } else {
-      return convertViaCanvas(file, options)
-    }
-
-    return new Blob([cleaned], { type })
+  // ── WebP output ────────────────────────────────────────────────────────────
+  if (options.format === 'webp') {
+    const blob = await canvasEncode(file, 'webp', options, { resize: true, fillWhite: deepClean })
+    const stripped = removeWebpMetadata(await blob.arrayBuffer())
+    return new Blob([stripped], { type: 'image/webp' })
   }
 
-  return convertViaCanvas(file, options)
+  // ── PNG / JPEG output ──────────────────────────────────────────────────────
+  // Build a clean WebP intermediate first (resize + LSB scrub happen here), then transcode.
+  const webpBlob = await canvasEncode(file, 'webp', options, { resize: true, fillWhite: deepClean })
+  const cleanWebpBuf = removeWebpMetadata(await webpBlob.arrayBuffer())
+  const cleanWebpFile = new File([cleanWebpBuf], 'intermediate.webp', { type: 'image/webp' })
+
+  // JPEG has no alpha — always paint a white background on the second pass.
+  const fillWhite = options.format === 'jpeg' || deepClean
+  const finalBlob = await canvasEncode(cleanWebpFile, options.format, options, { resize: false, fillWhite })
+  const finalBuf  = await finalBlob.arrayBuffer()
+
+  const stripped = options.format === 'png'
+    ? removePngMetadata(finalBuf)
+    : removeJpegMetadata(finalBuf)
+
+  return new Blob([stripped], { type: MIME[options.format] })
 }
 
-async function convertViaCanvas(file: File, options: ConvertOptions): Promise<Blob> {
-  const bitmap = await createImageBitmap(file)
+interface CanvasEncodeOpts {
+  resize: boolean    // apply options.resize percent
+  fillWhite: boolean // paint a white background before drawImage (kills alpha; deep clean only)
+}
+
+async function canvasEncode(
+  file: File,
+  outFormat: 'png' | 'jpeg' | 'webp',
+  options: ConvertOptions,
+  opts: CanvasEncodeOpts,
+): Promise<Blob> {
+  // premultiplyAlpha:'none' keeps raw alpha bytes intact so the LSB scrub below operates on
+  // the actual stealth-bearing values, not on premultiplied approximations.
+  const bitmap = await createImageBitmap(file, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })
 
   let w = bitmap.width
   let h = bitmap.height
-  if (options.resize !== 'original') {
+  if (opts.resize && options.resize !== 'original') {
     const pct = options.resize as number
     w = Math.round(w * pct / 100)
     h = Math.round(h * pct / 100)
   }
 
-  const mime    = MIME[options.format] ?? 'image/png'
-  const quality = options.format === 'png' ? undefined : options.quality / 100
+  const mime    = MIME[outFormat] ?? 'image/png'
+  // PNG: lossless (quality ignored). WebP intermediate: quality=1 → Chromium uses VP8L lossless.
+  // JPEG: user-controlled quality.
+  const quality =
+    outFormat === 'png' ? undefined
+    : outFormat === 'webp' ? 1
+    : options.quality / 100
 
   const drawAndExport = async (canvas: OffscreenCanvas | HTMLCanvasElement): Promise<Blob> => {
-    // 2D 컨텍스트 강제 캐스팅 (OffscreenCanvas도 2D 지원)
-    const ctx = canvas.getContext('2d') as (CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null)
+    const ctx = canvas.getContext('2d', { willReadFrequently: true }) as
+      (CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null)
     if (!ctx) throw new Error('Could not get 2D context')
-    
-    // 1. 배경 처리
-    if (options.format === 'jpeg' || (options.format === 'png' && options.deepClean)) {
-      // JPEG는 투명도가 없으므로 흰색 배경. 
-      // PNG Deep Clean 시에도 투명도를 제거(알파 채널 파괴)하여 스테가노그래피 완전 제거 유도.
+
+    if (opts.fillWhite) {
       ctx.fillStyle = '#ffffff'
       ctx.fillRect(0, 0, w, h)
     }
-    
-    // 2. 이미지 그리기
     ctx.drawImage(bitmap, 0, 0, w, h)
-    
-    // 3. Pixel Washing (스테가노그래피 파괴를 위한 미세 변동)
-    if (options.deepClean) {
-      // 픽셀 하나만 미세하게 변경하여 데이터 재구성 유도
-      const imageData = ctx.getImageData(0, 0, 1, 1)
-      imageData.data[0] = (imageData.data[0] + 1) % 256 
-      ctx.putImageData(imageData, 0, 0)
-    }
-    
     bitmap.close()
-    
+
+    // ── NAI stealth-pnginfo countermeasure ─────────────────────────────────
+    // NAI embeds prompt/seed/etc. in the alpha-channel LSB (mostly opaque pixels at α=255 with
+    // a sparse set at α=254 forming the payload bitstream). Force every alpha byte's LSB to 1
+    // so the bitstream collapses into a uniform pattern. Visual change is null on already-
+    // opaque pixels; on semi-transparent ones the opacity rises by ≤1/256 (imperceptible).
+    // Only useful when the canvas still carries alpha — i.e., not after fillWhite (which has
+    // already composited alpha away).
+    if (!opts.fillWhite) {
+      const imgData = ctx.getImageData(0, 0, w, h)
+      const px = imgData.data
+      for (let i = 3; i < px.length; i += 4) px[i] |= 0x01
+      ctx.putImageData(imgData, 0, 0)
+    }
+
     if ('convertToBlob' in canvas) {
       return (canvas as OffscreenCanvas).convertToBlob({ type: mime, quality })
-    } else {
-      return new Promise((resolve, reject) => {
-        (canvas as HTMLCanvasElement).toBlob(
-          blob => blob ? resolve(blob) : reject(new Error('toBlob failed')),
-          mime,
-          quality,
-        )
-      })
     }
+    return new Promise((resolve, reject) => {
+      (canvas as HTMLCanvasElement).toBlob(
+        blob => blob ? resolve(blob) : reject(new Error('toBlob failed')),
+        mime,
+        quality,
+      )
+    })
   }
 
   if (typeof OffscreenCanvas !== 'undefined') {
-    const canvas = new OffscreenCanvas(w, h)
-    return drawAndExport(canvas)
-  } else {
-    const canvas = document.createElement('canvas')
-    canvas.width  = w
-    canvas.height = h
-    return drawAndExport(canvas)
+    return drawAndExport(new OffscreenCanvas(w, h))
   }
+  const canvas = document.createElement('canvas')
+  canvas.width  = w
+  canvas.height = h
+  return drawAndExport(canvas)
 }

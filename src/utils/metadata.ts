@@ -174,9 +174,12 @@ export function removeWebpMetadata(buffer: ArrayBuffer): ArrayBuffer {
   for (const c of keep) {
     const len = 8 + c.size + (c.size % 2)
     out.set(src.slice(c.dataOffset - 8, c.dataOffset - 8 + len), off)
-    // Clear EXIF/XMP/ICC flags in VP8X if it exists
+    // Clear EXIF/XMP/ICCP flags in VP8X (libwebp format_constants.h):
+    //   ANIMATION=0x02, XMP=0x04, EXIF=0x08, ALPHA=0x10, ICCP=0x20
+    // Previously this mask was wrong (cleared ALPHA & ANIMATION instead of XMP & ICCP),
+    // which broke alpha display and left XMP/ICCP flag bits referring to deleted chunks.
     if (c.fourcc === 'VP8X') {
-      out[off + 8] &= ~(0x08 | 0x10 | 0x02)
+      out[off + 8] &= ~(0x08 | 0x04 | 0x20)
     }
     off += len
   }
@@ -325,12 +328,8 @@ export function removeJpegMetadata(buffer: ArrayBuffer): ArrayBuffer {
     const length = (src[offset + 2] << 8) | src[offset + 3]
     const fullLen = 2 + length
 
-    // APPn markers are 0xE0 ~ 0xEF
-    // APP0 (0xE0) is JFIF (keep it)
-    // APP1 (0xE1) is Exif/XMP (remove)
-    // APP2-15 are usually metadata or color profiles (remove)
-    // COM (0xFE) is comment (remove)
-    const isMetadata = (marker >= 0xE1 && marker <= 0xEF) || marker === 0xFE
+    // Strip all APPn markers (0xE0–0xEF) and COM (0xFE) — including JFIF/APP0
+    const isMetadata = (marker >= 0xE0 && marker <= 0xEF) || marker === 0xFE
     
     if (!isMetadata) {
       kept.push(src.slice(offset, offset + fullLen))
